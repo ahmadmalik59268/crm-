@@ -11,6 +11,8 @@ import {
   CRMTask,
   NotificationItem,
   CRMSettings,
+  CRMUserAccount,
+  UserRole,
 } from '../types/crm';
 import {
   INITIAL_LEADS,
@@ -28,6 +30,8 @@ import {
 } from '../data/demoData';
 
 const STORAGE_KEY = 'crestline_realty_crm_v1';
+const USERS_STORAGE_KEY = 'crestline_realty_crm_users_v1';
+export const PRIMARY_SUPER_ADMIN_EMAIL = 'malik59223@gmail.com';
 
 export interface CRMDatabaseSnapshot {
   leads: Lead[];
@@ -42,6 +46,68 @@ export interface CRMDatabaseSnapshot {
   notifications: NotificationItem[];
   settings: CRMSettings;
 }
+
+/**
+ * Safe JSON Fetch helper that gracefully handles Vercel static hosting
+ * where /api/* routes return 404 plain-text ("The page could not be found")
+ * instead of throwing "Unexpected token 'T', 'The page c'... is not valid JSON".
+ */
+export async function safeFetchJson(
+  url: string,
+  options?: RequestInit
+): Promise<{ available: boolean; ok: boolean; status: number; data: any }> {
+  try {
+    const res = await fetch(url, options);
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return { available: false, ok: false, status: res.status, data: null };
+    }
+    const text = await res.text();
+    if (!text || text.trim().startsWith('The page') || text.trim().startsWith('<')) {
+      return { available: false, ok: false, status: res.status, data: null };
+    }
+    const parsed = JSON.parse(text);
+    return { available: true, ok: res.ok, status: res.status, data: parsed };
+  } catch {
+    return { available: false, ok: false, status: 0, data: null };
+  }
+}
+
+const DEFAULT_SEED_USERS: CRMUserAccount[] = [
+  {
+    uid: 'usr-super-admin-malik',
+    email: PRIMARY_SUPER_ADMIN_EMAIL,
+    name: 'malik',
+    role: 'Super Admin',
+    agentId: '',
+    phone: '+92 300 8400111',
+    specialization: 'Executive Leadership & Full System Control',
+    accountStatus: 'Active',
+    loginPassword: '1234',
+  },
+  {
+    uid: 'usr-agent-ali-09',
+    email: 'alimalik59223@gmail.com',
+    name: 'ali',
+    role: 'Sales Agent',
+    agentId: 'AGT-09',
+    phone: '+92 300 0000000',
+    specialization: 'Real Estate Consultant',
+    accountStatus: 'Active',
+    loginPassword: 'agent123',
+  },
+  {
+    uid: 'usr-agent-hamza-10',
+    email: 'hamza112233@gmail.com',
+    name: 'hamza1',
+    role: 'Sales Agent',
+    agentId: 'AGT-10',
+    phone: '+92 300 0000000',
+    specialization: 'Real Estate Consultant',
+    accountStatus: 'Active',
+    loginPassword: '11223344',
+  },
+];
 
 /**
  * Currency & Budget Formatting Utility (PKR Crore / Lakh)
@@ -149,9 +215,211 @@ export function exportRecordsToCSV(filename: string, headers: string[], rows: (s
 }
 
 /**
- * Storage Adapter — Prepared for drop-in replacement with Supabase Client in Phase 2
+ * Storage Adapter — Supports Cloud SQL (/api/crm/*), Supabase, and Vercel Static Local Persistence
  */
 export const CRMStorageRepository = {
+  loadUsers(): CRMUserAccount[] {
+    try {
+      const raw = localStorage.getItem(USERS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Ensure primary Super Admin always exists
+          const hasSuper = parsed.some(
+            (u: any) =>
+              String(u.email || '').toLowerCase().trim() === PRIMARY_SUPER_ADMIN_EMAIL
+          );
+          const merged = hasSuper ? parsed : [DEFAULT_SEED_USERS[0], ...parsed];
+          return merged.map((u: any) => ({
+            ...u,
+            email: String(u.email || '').toLowerCase().trim(),
+            role:
+              String(u.email || '').toLowerCase().trim() === PRIMARY_SUPER_ADMIN_EMAIL
+                ? 'Super Admin'
+                : u.role === 'Super Admin'
+                ? 'Sales Agent'
+                : u.role || 'Sales Agent',
+            loginPassword: u.loginPassword || '123456',
+          }));
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load users from localStorage, using defaults.', e);
+    }
+    const seed = JSON.parse(JSON.stringify(DEFAULT_SEED_USERS));
+    this.saveUsers(seed);
+    return seed;
+  },
+
+  saveUsers(usersList: CRMUserAccount[]): void {
+    try {
+      localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(usersList));
+    } catch (e) {
+      console.warn('Failed to save users to localStorage.', e);
+    }
+  },
+
+  syncUsersAndSnapshotClientSide(
+    snapshot: CRMDatabaseSnapshot,
+    usersList: CRMUserAccount[]
+  ): { snapshot: CRMDatabaseSnapshot; users: CRMUserAccount[] } {
+    const updatedUsers = [...usersList];
+    const currentAgents: Agent[] = Array.isArray(snapshot.agents)
+      ? [...snapshot.agents]
+      : [];
+
+    // 1. Register any dashboard-added agent in updatedUsers if not present
+    for (const ag of currentAgents) {
+      if (!ag || !ag.id) continue;
+      const agEmail = String(ag.email || '').toLowerCase().trim();
+      if (!agEmail || agEmail === PRIMARY_SUPER_ADMIN_EMAIL) continue;
+
+      const existingUser = updatedUsers.find(
+        (u) =>
+          (u.email || '').toLowerCase().trim() === agEmail ||
+          (u.agentId && u.agentId === ag.id)
+      );
+
+      const isCustomAgent =
+        !agEmail.endsWith('@crestlinerealty.pk') ||
+        Boolean(ag.loginPassword) ||
+        Boolean(ag.systemRole);
+
+      if (!existingUser && isCustomAgent) {
+        const resolvedRole: UserRole =
+          ag.systemRole && ag.systemRole !== 'Super Admin'
+            ? ag.systemRole
+            : 'Sales Agent';
+        updatedUsers.push({
+          uid: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          email: agEmail,
+          name: ag.name || agEmail.split('@')[0],
+          role: resolvedRole,
+          agentId: ag.id,
+          phone: ag.phone || '+92 300 0000000',
+          specialization: ag.specialization || 'Real Estate Consultant',
+          accountStatus: ag.accountStatus || 'Active',
+          loginPassword: ag.loginPassword || '123456',
+        });
+      }
+    }
+
+    // 2. Ensure every non-Super-Admin user has a matching agent record in currentAgents
+    for (const u of updatedUsers) {
+      const cleanEmail = (u.email || '').toLowerCase().trim();
+      if (cleanEmail === PRIMARY_SUPER_ADMIN_EMAIL) {
+        u.role = 'Super Admin';
+        continue;
+      }
+      if (u.role === 'Super Admin') {
+        u.role = 'Sales Agent';
+      }
+
+      let targetAgentId = u.agentId || '';
+      const matchedAgent = currentAgents.find(
+        (a) =>
+          (targetAgentId && a.id === targetAgentId) ||
+          (cleanEmail && String(a.email || '').toLowerCase().trim() === cleanEmail)
+      );
+
+      if (!targetAgentId) {
+        if (matchedAgent) {
+          targetAgentId = matchedAgent.id;
+        } else {
+          const maxNum = currentAgents.reduce((max, a) => {
+            const num = parseInt(String(a.id || '').replace('AGT-', ''), 10);
+            return !isNaN(num) && num > max ? num : max;
+          }, 8);
+          const nextNum = maxNum + 1;
+          targetAgentId = nextNum < 10 ? `AGT-0${nextNum}` : `AGT-${nextNum}`;
+        }
+        u.agentId = targetAgentId;
+      }
+
+      const cleanName = (u.name || cleanEmail.split('@')[0] || 'Team Member').trim();
+      const parts = cleanName.split(' ');
+      const initials =
+        parts.length >= 2
+          ? `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase()
+          : cleanName.slice(0, 2).toUpperCase();
+
+      const roleBadgeTitle =
+        u.role === 'Sales Manager'
+          ? 'Sales Manager'
+          : u.role === 'Admin'
+          ? 'CRM Admin'
+          : 'Sales Agent';
+
+      if (!matchedAgent) {
+        currentAgents.unshift({
+          id: targetAgentId,
+          name: cleanName,
+          roleTitle: roleBadgeTitle,
+          systemRole: u.role as UserRole,
+          loginPassword: u.loginPassword || '123456',
+          avatarUrl: '',
+          initials,
+          phone: u.phone || '+92 300 0000000',
+          email: cleanEmail,
+          joiningDate: SYSTEM_TODAY,
+          accountStatus: (u.accountStatus as 'Active' | 'Inactive') || 'Active',
+          specialization: u.specialization || `${roleBadgeTitle} (${cleanEmail})`,
+        });
+      } else {
+        if (matchedAgent.loginPassword && matchedAgent.loginPassword !== u.loginPassword) {
+          u.loginPassword = matchedAgent.loginPassword;
+        }
+        if (
+          matchedAgent.systemRole &&
+          matchedAgent.systemRole !== 'Super Admin' &&
+          matchedAgent.systemRole !== u.role
+        ) {
+          u.role = matchedAgent.systemRole;
+        }
+        matchedAgent.name = cleanName;
+        matchedAgent.email = cleanEmail;
+        matchedAgent.roleTitle = roleBadgeTitle;
+        matchedAgent.systemRole = u.role as UserRole;
+        matchedAgent.loginPassword = u.loginPassword || '123456';
+      }
+    }
+
+    // 3. Remove duplicate demo agents AGT-07 ("Ali Raza") & AGT-02 ("Hamza Sikandar") when real users exist
+    const filteredAgents = currentAgents.filter((a) => {
+      if (
+        (a.id === 'AGT-07' || a.id === 'AGT-02') &&
+        String(a.email || '').includes('crestlinerealty.pk')
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    // 4. Deduplicate agents by ID and email
+    const seenIds = new Set<string>();
+    const seenEmails = new Set<string>();
+    const dedupedAgents: Agent[] = [];
+    for (const ag of filteredAgents) {
+      if (!ag || !ag.id) continue;
+      const idKey = String(ag.id).trim();
+      const emailKey = String(ag.email || '').toLowerCase().trim();
+      if (seenIds.has(idKey) || (emailKey && seenEmails.has(emailKey))) continue;
+      seenIds.add(idKey);
+      if (emailKey) seenEmails.add(emailKey);
+      dedupedAgents.push(ag);
+    }
+
+    const nextSnapshot: CRMDatabaseSnapshot = {
+      ...snapshot,
+      agents: dedupedAgents,
+    };
+
+    this.saveUsers(updatedUsers);
+    this.saveSnapshot(nextSnapshot);
+
+    return { snapshot: nextSnapshot, users: updatedUsers };
+  },
+
   loadSnapshot(): CRMDatabaseSnapshot {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -197,7 +465,9 @@ export const CRMStorageRepository = {
     } catch (e) {
       console.warn('Failed to read CRM snapshot from localStorage, falling back to seed data.', e);
     }
-    return this.getDefaultSnapshot();
+    const def = this.getDefaultSnapshot();
+    const synced = this.syncUsersAndSnapshotClientSide(def, this.loadUsers());
+    return synced.snapshot;
   },
 
   saveSnapshot(snapshot: CRMDatabaseSnapshot): void {

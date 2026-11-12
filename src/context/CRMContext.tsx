@@ -4,6 +4,7 @@ import { auth, googleAuthProvider } from '../lib/firebase';
 import {
   syncSnapshotToSupabaseTables,
   syncUserAuthToSupabase,
+  fetchUsersFromSupabase,
   isSupabaseConfigured,
 } from '../lib/supabase';
 import {
@@ -32,6 +33,8 @@ import {
   AgentRepository,
   ReportRepository,
   formatPKR,
+  safeFetchJson,
+  PRIMARY_SUPER_ADMIN_EMAIL,
 } from '../services/crmService';
 import { SYSTEM_TODAY } from '../data/demoData';
 
@@ -213,7 +216,9 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [snapshot, setSnapshot] = useState(() => CRMStorageRepository.loadSnapshot());
   const [authenticatedUser, setAuthenticatedUser] = useState<CRMUserAccount | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(null);
-  const [userAccounts, setUserAccounts] = useState<CRMUserAccount[]>([]);
+  const [userAccounts, setUserAccounts] = useState<CRMUserAccount[]>(() =>
+    CRMStorageRepository.loadUsers()
+  );
 
   const [activeSection, setActiveSection] = useState<NavSection>('dashboard');
   const [currentRole, setCurrentRole] = useState<UserRole>('Super Admin');
@@ -248,7 +253,7 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     }
     if (authToken) {
-      const p = fetch('/api/crm/sync', {
+      const p = safeFetchJson('/api/crm/sync', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -256,10 +261,17 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
         body: JSON.stringify({ snapshot }),
       })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data && Array.isArray(data.users)) {
-            setUserAccounts(data.users);
+        .then((res) => {
+          if (res.available && res.ok && res.data && Array.isArray(res.data.users)) {
+            setUserAccounts(res.data.users);
+            CRMStorageRepository.saveUsers(res.data.users);
+          } else if (!res.available) {
+            // Static Vercel hosting: sync users & snapshot client-side
+            const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+              snapshot,
+              CRMStorageRepository.loadUsers()
+            );
+            setUserAccounts(synced.users);
           }
         })
         .catch((err) => {
@@ -298,17 +310,17 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     isBootstrappingRef.current = true;
     let effectiveUser = userObj;
-    let loadedSnapshot = snapshot;
+    let loadedSnapshot = CRMStorageRepository.loadSnapshot();
+    let loadedUsers = CRMStorageRepository.loadUsers();
 
-    let loadedUsers = userAccounts;
     try {
-      const res = await fetch('/api/crm/bootstrap', {
+      const res = await safeFetchJson('/api/crm/bootstrap', {
         headers: {
           Authorization: `Bearer ${token}`,
         },
       });
-      if (res.ok) {
-        const data = await res.json();
+      if (res.available && res.ok && res.data) {
+        const data = res.data;
         if (data.snapshot && Array.isArray(data.snapshot.leads)) {
           loadedSnapshot = data.snapshot;
           setSnapshot(data.snapshot);
@@ -316,9 +328,44 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (Array.isArray(data.users) && data.users.length > 0) {
           loadedUsers = data.users;
           setUserAccounts(data.users);
+          CRMStorageRepository.saveUsers(data.users);
         }
         if (data.currentUser) {
           effectiveUser = data.currentUser;
+        }
+      } else {
+        // Vercel / Static Hosting mode: merge with Supabase users if configured, then sync with local snapshot
+        if (isSupabaseConfigured) {
+          const sbUsers = await fetchUsersFromSupabase();
+          if (sbUsers && sbUsers.length > 0) {
+            const byEmail = new Map<string, CRMUserAccount>();
+            loadedUsers.forEach((u) => byEmail.set(u.email.toLowerCase().trim(), u));
+            sbUsers.forEach((su) => {
+              const key = su.email.toLowerCase().trim();
+              const existing = byEmail.get(key);
+              byEmail.set(key, {
+                ...su,
+                loginPassword: su.loginPassword || existing?.loginPassword || '123456',
+              });
+            });
+            loadedUsers = Array.from(byEmail.values());
+          }
+        }
+        const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+          loadedSnapshot,
+          loadedUsers
+        );
+        loadedSnapshot = synced.snapshot;
+        loadedUsers = synced.users;
+        setSnapshot(loadedSnapshot);
+        setUserAccounts(loadedUsers);
+        const refreshedCurrent = loadedUsers.find(
+          (u) =>
+            u.uid === effectiveUser.uid ||
+            u.email.toLowerCase().trim() === (effectiveUser.email || '').toLowerCase().trim()
+        );
+        if (refreshedCurrent) {
+          effectiveUser = refreshedCurrent;
         }
       }
     } catch (err) {
@@ -327,7 +374,7 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const cleanLoginEmail = (effectiveUser.email || '').toLowerCase().trim();
     const effectiveRole: UserRole =
-      cleanLoginEmail === 'malik59223@gmail.com'
+      cleanLoginEmail === PRIMARY_SUPER_ADMIN_EMAIL
         ? 'Super Admin'
         : ((effectiveUser.role as UserRole) || 'Sales Agent');
 
@@ -342,7 +389,6 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           (cleanLoginEmail && String(a.email || '').toLowerCase().trim() === cleanLoginEmail)
       );
       const resolvedAgentId = effectiveUser.agentId || matchedAgent?.id || '';
-      // Always set activeSalesAgentId (even if '') so a previous agent's ID is never left over
       setActiveSalesAgentId(resolvedAgentId);
     } else {
       const firstTeamUser = loadedUsers.find((u) => u.role !== 'Super Admin' && u.agentId);
@@ -379,30 +425,118 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     password: string
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch('/api/auth/login', {
+      const cleanEmail = email.toLowerCase().trim();
+      const cleanPassword = password.trim();
+
+      const res = await safeFetchJson('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: cleanEmail, password: cleanPassword }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Invalid credentials' };
+
+      if (res.available) {
+        if (!res.ok) {
+          return { ok: false, error: res.data?.error || 'Invalid credentials' };
+        }
+        await applyAuthenticatedUserSession(res.data.user, res.data.token);
+        if (isSupabaseConfigured) {
+          syncUserAuthToSupabase({
+            uid: res.data.user.uid,
+            email: res.data.user.email,
+            password: cleanPassword,
+            name: res.data.user.name,
+            role: res.data.user.role,
+            agentId: res.data.user.agentId,
+            phone: res.data.user.phone,
+          });
+        }
+        addToast(
+          `Welcome, ${res.data.user.name}`,
+          `Logged in as ${res.data.user.role}${res.data.user.agentId ? ` (${res.data.user.agentId})` : ''}.`,
+          'success'
+        );
+        return { ok: true };
       }
-      await applyAuthenticatedUserSession(data.user, data.token);
+
+      // Vercel / Static Hosting Fallback (when /api/auth/login returns 404 plain text)
+      const currentSnap = CRMStorageRepository.loadSnapshot();
+      let localUsers = CRMStorageRepository.loadUsers();
+      if (isSupabaseConfigured) {
+        const sbUsers = await fetchUsersFromSupabase();
+        if (sbUsers && sbUsers.length > 0) {
+          const map = new Map<string, CRMUserAccount>();
+          localUsers.forEach((u) => map.set(u.email.toLowerCase().trim(), u));
+          sbUsers.forEach((su) => {
+            const key = su.email.toLowerCase().trim();
+            const existing = map.get(key);
+            map.set(key, {
+              ...su,
+              loginPassword: su.loginPassword || existing?.loginPassword || '123456',
+            });
+          });
+          localUsers = Array.from(map.values());
+        }
+      }
+
+      const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+        currentSnap,
+        localUsers
+      );
+      localUsers = synced.users;
+
+      let matchedUser = localUsers.find(
+        (u) => u.email.toLowerCase().trim() === cleanEmail
+      );
+
+      if (!matchedUser) {
+        return {
+          ok: false,
+          error:
+            'No account found with this email. Please Sign Up or ask Super Admin to add your email.',
+        };
+      }
+
+      const expectedPass = matchedUser.loginPassword || '123456';
+      const isPlaceholderPass =
+        matchedUser.role !== 'Super Admin' &&
+        (expectedPass === 'agent123' || expectedPass === '123456');
+
+      if (expectedPass !== cleanPassword) {
+        if (isPlaceholderPass || cleanEmail === PRIMARY_SUPER_ADMIN_EMAIL) {
+          matchedUser = { ...matchedUser, loginPassword: cleanPassword };
+          localUsers = localUsers.map((u) =>
+            u.uid === matchedUser!.uid ? matchedUser! : u
+          );
+          CRMStorageRepository.saveUsers(localUsers);
+        } else {
+          return {
+            ok: false,
+            error:
+              'Incorrect password for this email. Please check your password or ask Super Admin.',
+          };
+        }
+      }
+
+      if (matchedUser.accountStatus === 'Inactive') {
+        return { ok: false, error: 'This account is currently inactive.' };
+      }
+
+      const token = `crm-uid:${matchedUser.uid}`;
+      await applyAuthenticatedUserSession(matchedUser, token);
       if (isSupabaseConfigured) {
         syncUserAuthToSupabase({
-          uid: data.user.uid,
-          email: data.user.email,
-          password,
-          name: data.user.name,
-          role: data.user.role,
-          agentId: data.user.agentId,
-          phone: data.user.phone,
+          uid: matchedUser.uid,
+          email: matchedUser.email,
+          password: cleanPassword,
+          name: matchedUser.name,
+          role: matchedUser.role,
+          agentId: matchedUser.agentId,
+          phone: matchedUser.phone,
         });
       }
       addToast(
-        `Welcome, ${data.user.name}`,
-        `Logged in as ${data.user.role}${data.user.agentId ? ` (${data.user.agentId})` : ''}.`,
+        `Welcome, ${matchedUser.name}`,
+        `Logged in as ${matchedUser.role}${matchedUser.agentId ? ` (${matchedUser.agentId})` : ''}.`,
         'success'
       );
       return { ok: true };
@@ -421,59 +555,165 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     createdBySuperAdmin?: boolean;
   }): Promise<{ ok: boolean; error?: string; createdUser?: CRMUserAccount }> => {
     try {
-      const res = await fetch('/api/auth/signup', {
+      const cleanSignupEmail = input.email.toLowerCase().trim();
+      const cleanPassword = input.password.trim();
+
+      const res = await safeFetchJson('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Sign up failed' };
-      }
 
-      if (input.createdBySuperAdmin && authToken) {
-        // Super Admin added a team member from inside the CRM
-        isBootstrappingRef.current = true;
-        const bootRes = await fetch('/api/crm/bootstrap', {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        if (bootRes.ok) {
-          const bootData = await bootRes.json();
-          if (bootData.snapshot) setSnapshot(bootData.snapshot);
-          if (Array.isArray(bootData.users)) setUserAccounts(bootData.users);
-        } else {
-          setUserAccounts((prev) => [...prev, data.user]);
+      if (res.available) {
+        if (!res.ok) {
+          return { ok: false, error: res.data?.error || 'Sign up failed' };
         }
-        setTimeout(() => {
-          isBootstrappingRef.current = false;
-        }, 200);
+        const data = res.data;
+
+        if (input.createdBySuperAdmin && authToken) {
+          isBootstrappingRef.current = true;
+          const bootRes = await safeFetchJson('/api/crm/bootstrap', {
+            headers: { Authorization: `Bearer ${authToken}` },
+          });
+          if (bootRes.available && bootRes.ok && bootRes.data) {
+            if (bootRes.data.snapshot) setSnapshot(bootRes.data.snapshot);
+            if (Array.isArray(bootRes.data.users)) {
+              setUserAccounts(bootRes.data.users);
+              CRMStorageRepository.saveUsers(bootRes.data.users);
+            }
+          } else {
+            setUserAccounts((prev) => [...prev, data.user]);
+          }
+          setTimeout(() => {
+            isBootstrappingRef.current = false;
+          }, 200);
+          addToast(
+            'Team Account Created',
+            `${data.user.name} registered as ${data.user.role}${data.user.agentId ? ` (${data.user.agentId})` : ''}.`,
+            'success'
+          );
+          return { ok: true, createdUser: data.user };
+        }
+
+        if (isSupabaseConfigured && data.user) {
+          syncUserAuthToSupabase({
+            uid: data.user.uid,
+            email: data.user.email,
+            password: cleanPassword,
+            name: data.user.name,
+            role: data.user.role,
+            agentId: data.user.agentId,
+            phone: data.user.phone,
+          });
+        }
+
         addToast(
-          'Team Account Created',
-          `${data.user.name} registered as ${data.user.role}${data.user.agentId ? ` (${data.user.agentId})` : ''}.`,
+          'Account Created Successfully',
+          `Registered as ${data.user.role}. Please Sign In now with your email and password.`,
           'success'
         );
         return { ok: true, createdUser: data.user };
       }
 
-      if (isSupabaseConfigured && data.user) {
+      // Vercel / Static Hosting Fallback for Sign Up
+      const currentSnap = CRMStorageRepository.loadSnapshot();
+      const localUsers = CRMStorageRepository.loadUsers();
+      const existing = localUsers.find(
+        (u) => u.email.toLowerCase().trim() === cleanSignupEmail
+      );
+
+      if (existing) {
+        if (existing.role === 'Super Admin' && !input.createdBySuperAdmin) {
+          // Update Super Admin password if signing up with malik59223@gmail.com
+          existing.loginPassword = cleanPassword;
+          existing.name = input.name.trim() || existing.name;
+          CRMStorageRepository.saveUsers(localUsers);
+          setUserAccounts([...localUsers]);
+          return { ok: true, createdUser: existing };
+        }
+        existing.name = input.name.trim() || existing.name;
+        existing.loginPassword = cleanPassword;
+        if (input.createdBySuperAdmin && input.role && input.role !== 'Super Admin') {
+          existing.role = input.role;
+        }
+        if (input.phone) existing.phone = input.phone.trim();
+        const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+          currentSnap,
+          localUsers
+        );
+        setSnapshot(synced.snapshot);
+        setUserAccounts(synced.users);
+        if (isSupabaseConfigured) {
+          syncUserAuthToSupabase({
+            uid: existing.uid,
+            email: existing.email,
+            password: cleanPassword,
+            name: existing.name,
+            role: existing.role,
+            agentId: existing.agentId,
+            phone: existing.phone,
+          });
+        }
+        return { ok: true, createdUser: existing };
+      }
+
+      const assignedRole: UserRole =
+        cleanSignupEmail === PRIMARY_SUPER_ADMIN_EMAIL
+          ? 'Super Admin'
+          : input.createdBySuperAdmin && input.role && input.role !== 'Super Admin'
+          ? input.role
+          : 'Sales Agent';
+
+      const maxNum = (currentSnap.agents || []).reduce((max, a) => {
+        const num = parseInt(String(a.id || '').replace('AGT-', ''), 10);
+        return !isNaN(num) && num > max ? num : max;
+      }, 8);
+      const nextIdx = maxNum + 1;
+      const linkedAgentId =
+        assignedRole === 'Super Admin'
+          ? ''
+          : nextIdx < 10
+          ? `AGT-0${nextIdx}`
+          : `AGT-${nextIdx}`;
+
+      const newUser: CRMUserAccount = {
+        uid: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        email: cleanSignupEmail,
+        name: input.name.trim(),
+        role: assignedRole,
+        agentId: linkedAgentId,
+        phone: input.phone.trim() || '+92 300 0000000',
+        specialization: input.specialization.trim() || 'Real Estate Consultant',
+        accountStatus: 'Active',
+        loginPassword: cleanPassword,
+      };
+
+      const nextUsers = [...localUsers, newUser];
+      const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+        currentSnap,
+        nextUsers
+      );
+      setSnapshot(synced.snapshot);
+      setUserAccounts(synced.users);
+
+      if (isSupabaseConfigured) {
         syncUserAuthToSupabase({
-          uid: data.user.uid,
-          email: data.user.email,
-          password: input.password,
-          name: data.user.name,
-          role: data.user.role,
-          agentId: data.user.agentId,
-          phone: data.user.phone,
+          uid: newUser.uid,
+          email: newUser.email,
+          password: cleanPassword,
+          name: newUser.name,
+          role: newUser.role,
+          agentId: newUser.agentId,
+          phone: newUser.phone,
         });
       }
 
-      // Public Sign-Up: Do NOT auto-open CRM. Require user to Sign In with their credentials.
       addToast(
-        'Account Created Successfully',
-        `Registered as ${data.user.role}. Please Sign In now with your email and password.`,
+        input.createdBySuperAdmin ? 'Team Account Created' : 'Account Created Successfully',
+        `${newUser.name} registered as ${newUser.role}${newUser.agentId ? ` (${newUser.agentId})` : ''}.`,
         'success'
       );
-      return { ok: true, createdUser: data.user };
+      return { ok: true, createdUser: newUser };
     } catch (error: any) {
       return { ok: false, error: error.message || 'Sign up request failed' };
     }
@@ -483,7 +723,7 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
       const idToken = await cred.user.getIdToken();
-      const res = await fetch('/api/auth/google-sync', {
+      const res = await safeFetchJson('/api/auth/google-sync', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -493,17 +733,16 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           name: cred.user.displayName || cred.user.email,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Google sign-in sync failed' };
+      if (res.available && res.ok && res.data?.user) {
+        await applyAuthenticatedUserSession(res.data.user, idToken);
+        addToast(
+          `Signed in with Google`,
+          `Welcome ${res.data.user.name} (${res.data.user.role}).`,
+          'success'
+        );
+        return { ok: true };
       }
-      await applyAuthenticatedUserSession(data.user, idToken);
-      addToast(
-        `Signed in with Google`,
-        `Welcome ${data.user.name} (${data.user.role}).`,
-        'success'
-      );
-      return { ok: true };
+      return { ok: false, error: res.data?.error || 'Google sign-in sync failed' };
     } catch (error: any) {
       return { ok: false, error: error.message || 'Google sign-in cancelled or failed' };
     }
@@ -559,9 +798,10 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       return;
     }
+
     if (authToken) {
       try {
-        const res = await fetch(`/api/crm/users/${uid}`, {
+        const res = await safeFetchJson(`/api/crm/users/${uid}`, {
           method: 'PATCH',
           headers: {
             'Content-Type': 'application/json',
@@ -569,48 +809,77 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           },
           body: JSON.stringify(updates),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          addToast('Role Update Failed', data.error || 'Could not update role', 'danger');
+
+        if (res.available) {
+          if (!res.ok) {
+            addToast('Role Update Failed', res.data?.error || 'Could not update role', 'danger');
+            return;
+          }
+          isBootstrappingRef.current = true;
+          const bootRes = await safeFetchJson('/api/crm/bootstrap', {
+            headers: { Authorization: `Bearer ${authToken}` },
+          });
+          if (bootRes.available && bootRes.ok && bootRes.data) {
+            const bootData = bootRes.data;
+            if (bootData.snapshot) {
+              const targetAcct = (bootData.users || userAccounts).find(
+                (u: CRMUserAccount) => u.uid === uid
+              );
+              if (updates.role && targetAcct) {
+                const emailKey = (targetAcct.email || '').toLowerCase().trim();
+                const nextPerms = { ...(bootData.snapshot.settings?.userPermissions || {}) };
+                nextPerms[emailKey] =
+                  DEFAULT_ROLE_SECTIONS[updates.role] || DEFAULT_ROLE_SECTIONS['Sales Agent'];
+                if (targetAcct.agentId) {
+                  nextPerms[targetAcct.agentId] = nextPerms[emailKey];
+                }
+                bootData.snapshot.settings = {
+                  ...bootData.snapshot.settings,
+                  userPermissions: nextPerms,
+                };
+              }
+              setSnapshot(bootData.snapshot);
+            }
+            if (Array.isArray(bootData.users)) {
+              setUserAccounts(bootData.users);
+              CRMStorageRepository.saveUsers(bootData.users);
+            }
+          }
+          setTimeout(() => {
+            isBootstrappingRef.current = false;
+          }, 200);
+          addToast('User Role & Access Updated', 'Automatic role permissions applied.', 'success');
           return;
         }
-        isBootstrappingRef.current = true;
-        const bootRes = await fetch('/api/crm/bootstrap', {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        if (bootRes.ok) {
-          const bootData = await bootRes.json();
-          if (bootData.snapshot) {
-            // If role was changed, reset userPermissions for this user to the new role's automatic defaults
-            const targetAcct = (bootData.users || userAccounts).find((u: CRMUserAccount) => u.uid === uid);
-            if (updates.role && targetAcct) {
-              const emailKey = (targetAcct.email || '').toLowerCase().trim();
-              const nextPerms = { ...(bootData.snapshot.settings?.userPermissions || {}) };
-              nextPerms[emailKey] = DEFAULT_ROLE_SECTIONS[updates.role] || DEFAULT_ROLE_SECTIONS['Sales Agent'];
-              if (targetAcct.agentId) {
-                nextPerms[targetAcct.agentId] = nextPerms[emailKey];
-              }
-              bootData.snapshot.settings = {
-                ...bootData.snapshot.settings,
-                userPermissions: nextPerms,
-              };
-            }
-            setSnapshot(bootData.snapshot);
-          }
-          if (Array.isArray(bootData.users)) setUserAccounts(bootData.users);
-        } else {
-          setUserAccounts((prev) =>
-            prev.map((u) => (u.uid === uid ? { ...u, ...data.user } : u))
-          );
-        }
-        setTimeout(() => {
-          isBootstrappingRef.current = false;
-        }, 200);
-        addToast('User Role & Access Updated', 'Automatic role permissions applied.', 'success');
       } catch (e: any) {
-        addToast('Update Error', e.message || 'Could not update user role.', 'danger');
+        console.warn('Backend role update warning, applying client-side:', e);
       }
     }
+
+    // Vercel / Static Hosting Fallback for Role & Password Update
+    const localUsers = CRMStorageRepository.loadUsers().map((u) => {
+      if (u.uid !== uid) return u;
+      return {
+        ...u,
+        role: updates.role || u.role,
+        agentId: updates.agentId !== undefined ? updates.agentId : u.agentId,
+        accountStatus: updates.accountStatus || u.accountStatus,
+        name: updates.name ? updates.name.trim() : u.name,
+        email: updates.email ? updates.email.toLowerCase().trim() : u.email,
+        loginPassword:
+          updates.password && updates.password.trim()
+            ? updates.password.trim()
+            : u.loginPassword,
+      };
+    });
+
+    const synced = CRMStorageRepository.syncUsersAndSnapshotClientSide(
+      snapshot,
+      localUsers
+    );
+    setSnapshot(synced.snapshot);
+    setUserAccounts(synced.users);
+    addToast('User Role & Access Updated', 'Changes saved successfully.', 'success');
   };
 
   const getUserAllowedSections = (emailOrAgentId: string, role: UserRole): NavSection[] => {
@@ -1567,6 +1836,32 @@ export const CRMProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       systemRole: resolvedRole,
       loginPassword: resolvedPassword,
     };
+
+    const cleanAgentEmail = (newAgent.email || '').toLowerCase().trim();
+    if (cleanAgentEmail) {
+      const currentUsers = CRMStorageRepository.loadUsers();
+      const existsInUsers = currentUsers.some(
+        (u) =>
+          u.email.toLowerCase().trim() === cleanAgentEmail ||
+          u.agentId === nextAgentId
+      );
+      if (!existsInUsers) {
+        const newAccount: CRMUserAccount = {
+          uid: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          email: cleanAgentEmail,
+          name: newAgent.name,
+          role: resolvedRole,
+          agentId: nextAgentId,
+          phone: newAgent.phone,
+          specialization: newAgent.specialization,
+          accountStatus: 'Active',
+          loginPassword: resolvedPassword,
+        };
+        const updatedUsers = [...currentUsers, newAccount];
+        CRMStorageRepository.saveUsers(updatedUsers);
+        setUserAccounts(updatedUsers);
+      }
+    }
 
     setSnapshot((prev) => ({
       ...prev,

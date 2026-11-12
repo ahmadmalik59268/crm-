@@ -360,3 +360,50 @@ export async function syncUserAuthToSupabase(input: {
   }
 }
 
+/**
+ * Loads registered users and CRM leads/agents from Supabase tables when deployed on Vercel
+ */
+export async function fetchUsersFromSupabase(): Promise<CRMUserAccount[] | null> {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase.from('users').select('*');
+    if (error || !Array.isArray(data) || data.length === 0) return null;
+    return data.map((r: any) => ({
+      uid: r.uid || `usr-${r.id || Date.now()}`,
+      email: String(r.email || '').toLowerCase().trim(),
+      name: r.name || String(r.email || '').split('@')[0],
+      role:
+        String(r.email || '').toLowerCase().trim() === 'malik59223@gmail.com'
+          ? 'Super Admin'
+          : r.role || 'Sales Agent',
+      agentId: r.agent_id || '',
+      phone: r.phone || '+92 300 0000000',
+      specialization: r.specialization || 'Real Estate Consultant',
+      accountStatus: r.account_status || 'Active',
+      loginPassword: r.password_hash || undefined,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchLeadsAndAgentsFromSupabase(): Promise<{
+  leads?: any[];
+  agents?: any[];
+} | null> {
+  if (!supabase) return null;
+  try {
+    const [leadsRes, agentsRes] = await Promise.all([
+      supabase.from('crm_leads').select('*'),
+      supabase.from('crm_agents').select('*'),
+    ]);
+    return {
+      leads: Array.isArray(leadsRes.data) && leadsRes.data.length > 0 ? leadsRes.data : undefined,
+      agents: Array.isArray(agentsRes.data) && agentsRes.data.length > 0 ? agentsRes.data : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+
